@@ -1,0 +1,199 @@
+--- a/src/repository/download.rs
++++ b/src/repository/download.rs
+@@ -38,6 +38,8 @@
+ use crate::error::{HFError, HFResult};
+ use crate::progress::{DownloadEvent, EmitEvent, FileProgress, FileStatus, Progress};
+ use crate::{constants, retry};
++#[cfg(not(target_family = "wasm"))]
++use super::download_path::{local_download_path, validate_filename};
+ 
+ /// Boxed byte stream returned by [`HFRepository::download_file_stream`].
+ ///
+@@ -92,6 +94,10 @@
+ 
+     #[cfg(not(target_family = "wasm"))]
+     async fn download_file_inner(&self, params: &DownloadFileParams) -> HFResult<PathBuf> {
++        validate_filename(&params.filename)?;
++        if let Some(ref local_dir) = params.local_dir {
++            local_download_path(local_dir, &params.filename)?;
++        }
+         if params.local_dir.is_some() {
+             self.download_file_to_local_dir(params).await
+         } else {
+@@ -320,7 +326,7 @@
+         let local_dir = params.local_dir.as_ref().unwrap();
+         std::fs::create_dir_all(local_dir)?;
+ 
+-        let dest_path = local_dir.join(&params.filename);
++        let dest_path = local_download_path(local_dir, &params.filename)?;
+         if let Some(parent) = dest_path.parent() {
+             std::fs::create_dir_all(parent)?;
+         }
+@@ -608,6 +614,9 @@
+         while let Some(entry) = stream.next().await {
+             let entry = entry?;
+             if let RepoTreeEntry::File { path, .. } = entry {
++                // Reject remote traversal paths before any cache lookups or HEADs,
++                // including HEAD-404 negative-cache writes.
++                validate_filename(&path)?;
+                 filenames.push(path);
+             }
+         }
+@@ -659,6 +668,13 @@
+ 
+         let total_files = filenames.len();
+         let force = params.force_download;
++
++        if let Some(ref local_dir) = params.local_dir {
++            for filename in &filenames {
++                local_download_path(local_dir, filename)?;
++                local_download_path(local_dir, &format!("{filename}.incomplete"))?;
++            }
++        }
+ 
+         let mut cached_filenames = Vec::new();
+         if !force && params.local_dir.is_none() {
+@@ -758,7 +774,7 @@
+         if let Some(ref local_dir) = params.local_dir {
+             let mut local_cached = Vec::new();
+             for meta in file_metas {
+-                let dest = local_dir.join(&meta.filename);
++                let dest = local_download_path(local_dir, &meta.filename)?;
+                 if dest.exists() && !force {
+                     local_cached.push(meta.filename);
+                     continue;
+@@ -789,13 +805,17 @@
+                 }
+                 let batch_files: Vec<crate::xet::XetBatchFile> = xet_metas
+                     .iter()
+-                    .map(|m| crate::xet::XetBatchFile {
++                    .map(|m| {
++                        let path = local_download_path(local_dir, &m.filename)?;
++                        local_download_path(local_dir, &format!("{}.incomplete", m.filename))?;
++                        Ok(crate::xet::XetBatchFile {
+                         hash: m.xet_hash.as_ref().unwrap().clone(),
+                         file_size: m.file_size,
+-                        path: local_dir.join(&m.filename),
++                        path,
+                         filename: m.filename.clone(),
++                        })
+                     })
+-                    .collect();
++                    .collect::<HFResult<_>>()?;
+                 self.xet_download_batch(&commit_hash, &batch_files, &params.progress).await?;
+                 Ok(())
+             };
+--- /dev/null
++++ b/src/repository/download_path.rs
+@@ -0,0 +1,82 @@
++//! Checks for repository-controlled filenames before using them as local paths.
++
++use std::{
++    fs,
++    path::{Component, Path, PathBuf},
++};
++
++use crate::error::{HFError, HFResult};
++
++pub(super) fn validate_filename(filename: &str) -> HFResult<()> {
++    // Check both platforms' syntax, even when the client is running on Unix.
++    // Splitting also detects dot/empty segments that Path::components normalizes.
++    if filename.is_empty()
++        || filename.chars().any(|c| c.is_control() || matches!(c, '\\' | ':'))
++        || filename
++            .split('/')
++            .any(|part| part.is_empty() || part == "." || part == "..")
++        || Path::new(filename)
++            .components()
++            .any(|part| !matches!(part, Component::Normal(_)))
++    {
++        return Err(HFError::InvalidParameter(format!(
++            "unsafe download filename: {filename:?}"
++        )));
++    }
++    #[cfg(windows)]
++    for part in filename.split('/') {
++        let stem = part
++            .split('.')
++            .next()
++            .unwrap_or_default()
++            .trim_end_matches(' ')
++            .to_ascii_uppercase();
++        if part.ends_with(['.', ' '])
++            || part.contains(['<', '>', '"', '|', '?', '*'])
++            || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
++            || ((stem.starts_with("COM") || stem.starts_with("LPT"))
++                && stem.chars().count() == 4
++                && matches!(stem.chars().last(), Some('1'..='9' | '¹' | '²' | '³')))
++        {
++            return Err(HFError::InvalidParameter(format!(
++                "unsafe Windows download filename: {filename:?}"
++            )));
++        }
++    }
++    Ok(())
++}
++
++pub(crate) fn local_download_path(local_dir: &Path, filename: &str) -> HFResult<PathBuf> {
++    validate_filename(filename)?;
++    // The caller chooses local_dir; links below that root are not repository paths.
++    // This rejects existing links, not concurrent changes by another local process.
++    let mut path = local_dir.to_path_buf();
++    for part in filename.split('/') {
++        path.push(part);
++        match fs::symlink_metadata(&path) {
++            Ok(metadata) if is_link(&metadata) => {
++                return Err(HFError::InvalidParameter(format!(
++                    "download path contains a link: {}",
++                    path.display()
++                )));
++            }
++            Ok(_) => {}
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
++            Err(error) => return Err(error.into()),
++        }
++    }
++    Ok(path)
++}
++
++fn is_link(metadata: &fs::Metadata) -> bool {
++    #[cfg(windows)]
++    {
++        use std::os::windows::fs::MetadataExt;
++        // Includes junctions and other reparse points, not just symbolic links.
++        metadata.file_attributes() & 0x400 != 0
++    }
++    #[cfg(not(windows))]
++    {
++        metadata.file_type().is_symlink()
++    }
++}
+--- a/src/repository/mod.rs
++++ b/src/repository/mod.rs
+@@ -22,6 +22,8 @@
+ pub mod commits;
+ pub mod diff;
+ pub mod download;
++#[cfg(not(target_family = "wasm"))]
++pub(crate) mod download_path;
+ pub mod files;
+ pub mod listing;
+ pub mod repo_type;
+--- a/src/xet.rs
++++ b/src/xet.rs
+@@ -561,6 +561,7 @@
+         head_response: &reqwest::Response,
+         progress: &Option<Progress>,
+     ) -> HFResult<PathBuf> {
++        let dest_path = crate::repository::download_path::local_download_path(local_dir, filename)?;
+         let repo_path = self.repo_path();
+         let api_segment = self.repo_type.plural();
+         let file_hash = crate::repository::extract_xet_hash(head_response)
+@@ -578,7 +579,6 @@
+         .await?;
+ 
+         std::fs::create_dir_all(local_dir)?;
+-        let dest_path = local_dir.join(filename);
+         if let Some(parent) = dest_path.parent() {
+             std::fs::create_dir_all(parent)?;
+         }

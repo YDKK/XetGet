@@ -1,0 +1,33 @@
+--- a/src/repository/download.rs
++++ b/src/repository/download.rs
+@@ -271,21 +271,21 @@
+             .download_url(self.repo_type.url_prefix(), &repo_path, revision, &params.filename)?;
+ 
+         let headers = self.hf_client.auth_headers();
+-        let head_response = retry::retry(self.hf_client.retry_config(), || {
+-            self.hf_client.http_client().head(&url).headers(headers.clone()).send()
+-        })
+-        .await?;
+-
+-        let head_response = self
+-            .hf_client
+-            .check_response(
++        // Preserve the Hub's X-Xet-Hash and X-Linked-Size before a CDN redirect.
++        let head_response = self.hf_client.head_with_relative_redirects(&url, &headers).await?;
++
++        let head_response = if head_response.status().is_redirection() {
++            head_response
++        } else {
++            self.hf_client.check_response(
+                 head_response,
+                 Some(&repo_path),
+                 crate::error::NotFoundContext::Entry {
+                     path: params.filename.clone(),
+                 },
+             )
+-            .await?;
++            .await?
++        };
+ 
+         let file_size = extract_file_size(&head_response).unwrap_or(0);
+         let has_xet_hash = head_response.headers().get(constants::HEADER_X_XET_HASH).is_some();

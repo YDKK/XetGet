@@ -1,0 +1,80 @@
+[package]
+name = "xetget"
+version = "0.1.0"
+edition = "2024"
+description = "A simple CLI tool for downloading files directly from Hugging Face using Xet"
+license = "Apache-2.0"
+repository = "https://github.com/YDKK/XetGet"
+authors = ["YDKK"]
+readme = "README.md"
+keywords = ["huggingface", "xet", "download", "cli"]
+categories = ["command-line-utilities", "network-programming"]
+publish = ["crates-io"]
+include = [
+    "src/**",
+    "tests/**",
+    "vendor/hf-hub/src/**",
+    "vendor/hf-hub/LICENSE",
+    "vendor/hf-hub/Cargo.toml.upstream",
+    "vendor/hf-hub/XETGET-PATCH.md",
+    "patches/hf-hub/**",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+]
+
+# Compile the patched Hub client inside this package. A path dependency or
+# [patch.crates-io] override would not survive publication to crates.io.
+# The library name keeps upstream source imports and regression tests intact;
+# it is an implementation detail of the CLI, not a supported library API.
+[lib]
+name = "hf_hub"
+path = "src/hub.rs"
+doc = false
+doctest = false
+
+[features]
+default = []
+blocking = ["tokio/rt"]
+rustls-tls = ["reqwest/rustls"]
+socks = ["reqwest/socks"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bon = "3"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+globset = "0.4"
+hf-xet = "1.5.3"
+hyper = "1"
+indicatif = "0.18"
+pathdiff = "0.2"
+percent-encoding = "2"
+reqwest = { version = "0.13", features = ["json", "stream", "multipart", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-util"] }
+tokio-retry = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+serial_test = "3"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - id: version
+        name: Require a tag matching Cargo.toml
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'xetget').version
+          if ($env:GITHUB_REF_TYPE -ne 'tag' -or $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Run this workflow on the v$version tag."
+          }
+          "version=$version" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+
+  check:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [version, check]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --all-targets
+      - name: Build release archive
+        id: package
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -Target '${{ matrix.target }}'
+      - uses: cargo-bins/cargo-binstall@5885714d0a40a14b2535c6ffc051fd8e49aa9665 # v1.27.0
+        with:
+          version: v1.27.0
+      - name: Install the archive with cargo-binstall (no compilation fallback)
+        env:
+          XETGET_TEST_ARCHIVE: ${{ steps.package.outputs.archive }}
+          XETGET_TEST_TARGET: ${{ matrix.target }}
+        run: cargo test --locked --test distribution -- --ignored --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xetget-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: xetget-*
+          path: dist
+          merge-multiple: true
+      - name: Create or update the draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft > release.json; then
+            test "$(jq -r .isDraft release.json)" = true || { echo 'Refusing to replace a published release'; exit 1; }
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --draft --title "$RELEASE_TAG" --generate-notes
+          fi
